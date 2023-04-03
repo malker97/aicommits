@@ -1,46 +1,49 @@
 import https from 'https';
-import type { CreateCompletionRequest, CreateCompletionResponse } from 'openai';
-import { encoding_for_model as encodingForModel } from '@dqbd/tiktoken';
+import type { ClientRequest, IncomingMessage } from 'http';
+import type { CreateChatCompletionRequest, CreateChatCompletionResponse } from 'openai';
+import { type TiktokenModel, encoding_for_model as encodingForModel } from '@dqbd/tiktoken';
+import createHttpsProxyAgent from 'https-proxy-agent';
 import { KnownError } from './error.js';
 
-const createCompletion = (
-	apiKey: string,
-	json: CreateCompletionRequest,
-) => new Promise<CreateCompletionResponse>((resolve, reject) => {
+const httpsPost = async (
+	hostname: string,
+	path: string,
+	headers: Record<string, string>,
+	json: unknown,
+	proxy?: string,
+) => new Promise<{
+	request: ClientRequest;
+	response: IncomingMessage;
+	data: string;
+}>((resolve, reject) => {
 	const postContent = JSON.stringify(json);
 	const request = https.request(
 		{
 			port: 443,
-			hostname: 'api.openai.com',
-			path: '/v1/completions',
+			hostname,
+			path,
 			method: 'POST',
 			headers: {
+				...headers,
 				'Content-Type': 'application/json',
-				'Content-Length': postContent.length,
-				Authorization: `Bearer ${apiKey}`,
+				'Content-Length': Buffer.byteLength(postContent),
 			},
 			timeout: 10_000, // 10s
+			agent: (
+				proxy
+					? createHttpsProxyAgent(proxy)
+					: undefined
+			),
 		},
 		(response) => {
-			if (
-				!response.statusCode
-				|| response.statusCode < 200
-				|| response.statusCode > 299
-			) {
-				let errorMessage = `OpenAI API Error: ${response.statusCode} - ${response.statusMessage}`;
-				if (response.statusCode === 500) {
-					errorMessage += '; Check the API status: https://status.openai.com';
-				}
-
-				return reject(new KnownError(errorMessage));
-			}
-
 			const body: Buffer[] = [];
 			response.on('data', chunk => body.push(chunk));
 			response.on('end', () => {
-				resolve(
-					JSON.parse(Buffer.concat(body).toString()),
-				);
+				resolve({
+					request,
+					response,
+					data: Buffer.concat(body).toString(),
+				});
 			});
 		},
 	);
@@ -54,46 +57,90 @@ const createCompletion = (
 	request.end();
 });
 
+const createChatCompletion = async (
+	apiKey: string,
+	json: CreateChatCompletionRequest,
+	proxy?: string,
+) => {
+	const { response, data } = await httpsPost(
+		'api.openai.com',
+		'/v1/chat/completions',
+		{
+			Authorization: `Bearer ${apiKey}`,
+		},
+		json,
+		proxy,
+	);
+
+	if (
+		!response.statusCode
+		|| response.statusCode < 200
+		|| response.statusCode > 299
+	) {
+		let errorMessage = `OpenAI API Error: ${response.statusCode} - ${response.statusMessage}`;
+
+		if (data) {
+			errorMessage += `\n\n${data}`;
+		}
+
+		if (response.statusCode === 500) {
+			errorMessage += '\n\nCheck the API status: https://status.openai.com';
+		}
+
+		throw new KnownError(errorMessage);
+	}
+
+	return JSON.parse(data) as CreateChatCompletionResponse;
+};
+
 const sanitizeMessage = (message: string) => message.trim().replace(/[\n\r]/g, '').replace(/(\w)\.$/, '$1');
 
 const deduplicateMessages = (array: string[]) => Array.from(new Set(array));
 
-const promptTemplate = 'Write an insightful but concise Git commit message in a complete sentence in present tense for the following diff without prefacing it with anything:';
-
-const model = 'text-davinci-003';
-const encoder = encodingForModel(model);
+const getPrompt = (locale: string, diff: string) => `Write an insightful but concise Git commit message in a complete sentence in present tense for the following diff without prefacing it with anything, the response must be in the language ${locale}:\n${diff}`;
 
 export const generateCommitMessage = async (
 	apiKey: string,
+	model: TiktokenModel,
+	locale: string,
 	diff: string,
 	completions: number,
+	proxy?: string,
 ) => {
-	const prompt = `${promptTemplate}\n${diff}`;
+	const prompt = getPrompt(locale, diff);
 
 	/**
 	 * text-davinci-003 has a token limit of 4000
 	 * https://platform.openai.com/docs/models/overview#:~:text=to%20Sep%202021-,text%2Ddavinci%2D003,-Can%20do%20any
 	 */
-	if (encoder.encode(prompt).length > 4000) {
+	if (encodingForModel(model).encode(prompt).length > 4000) {
 		throw new KnownError('The diff is too large for the OpenAI API. Try reducing the number of staged changes, or write your own commit message.');
 	}
 
 	try {
-		const completion = await createCompletion(apiKey, {
-			model,
-			prompt,
-			temperature: 0.7,
-			top_p: 1,
-			frequency_penalty: 0,
-			presence_penalty: 0,
-			max_tokens: 200,
-			stream: false,
-			n: completions,
-		});
+		const completion = await createChatCompletion(
+			apiKey,
+			{
+				model,
+				messages: [{
+					role: 'user',
+					content: prompt,
+				}],
+				temperature: 0.7,
+				top_p: 1,
+				frequency_penalty: 0,
+				presence_penalty: 0,
+				max_tokens: 200,
+				stream: false,
+				n: completions,
+			},
+			proxy,
+		);
 
 		return deduplicateMessages(
 			completion.choices
-				.map(choice => sanitizeMessage(choice.text!)),
+				.filter(choice => choice.message?.content)
+				.map(choice => sanitizeMessage(choice.message!.content)),
 		);
 	} catch (error) {
 		const errorAsAny = error as any;
